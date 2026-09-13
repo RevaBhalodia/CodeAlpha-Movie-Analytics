@@ -1,34 +1,20 @@
 """
-CodeAlpha Data Analytics Internship - Task 1: Web Scraping
-============================================================
-Project theme: Movie Analytics (feeds into Tasks 2, 3 and 4)
+Task 1: Web Scraping - Movie Analytics project
+CodeAlpha Data Analytics Internship
 
-What this script does
-----------------------
-1. Scrapes the Wikipedia "List of highest-grossing films" table using
-   requests + BeautifulSoup (classic web scraping, no anti-bot issues,
-   Wikipedia is scrape-friendly for reasonable, low-frequency use).
-2. Enriches every movie with richer metadata (genre, IMDb rating, runtime,
-   director, language, country, votes, box office) via the free OMDb API.
-   This turns a bare "title + gross" list into a dataset that's actually
-   rich enough for interesting EDA and visualizations later.
-3. Saves a clean CSV to data/movies_raw.csv and a checkpoint file so you
-   never lose progress if the run is interrupted.
+Grabs the highest-grossing films table off Wikipedia, then fills in the
+extra details (genre, rating, runtime, director...) using the OMDb API,
+since Wikipedia's table alone is pretty bare.
 
-Before you run it
-------------------
+Steps to run:
 1. pip install -r requirements.txt
-2. Get a FREE OMDb API key (instant, just an email): https://www.omdbapi.com/apikey.aspx
-3. Set it as an environment variable so you never hardcode a secret:
-       Windows (PowerShell):  $env:OMDB_API_KEY="yourkeyhere"
-       Mac/Linux:              export OMDB_API_KEY="yourkeyhere"
-4. Run:  python scrape_movies.py
+2. python scrape_movies.py
 
-Why this counts as "web scraping" for the internship task
------------------------------------------------------------
-Step 1 is textbook BeautifulSoup table scraping. Step 2 (API enrichment)
-is a bonus skill on top — it shows you can combine multiple data sources
-into one clean dataset, which is exactly what real analysts do.
+Your OMDb key is already set below as a fallback, but it's better practice
+to keep it out of code that goes to GitHub. If you want to do that properly,
+set it as an environment variable instead and it'll be picked up automatically:
+    Windows:     $env:OMDB_API_KEY="your_key"
+    Mac/Linux:   export OMDB_API_KEY="your_key"
 """
 
 import os
@@ -44,18 +30,18 @@ from bs4 import BeautifulSoup
 # ------------------------------------------------------------------
 WIKI_URL = "https://en.wikipedia.org/wiki/List_of_highest-grossing_films"
 OMDB_URL = "http://www.omdbapi.com/"
-OMDB_API_KEY = os.environ.get("OMDB_API_KEY", "")  # set this in your environment
-HEADERS = {
-    # Wikipedia asks bots/scripts to identify themselves - be a good citizen
-    "User-Agent": "CodeAlpha-Internship-MovieAnalytics/1.0 (educational project)"
-}
+
+# Uses the env variable if it's set, otherwise falls back to the key below
+OMDB_API_KEY = os.environ.get("OMDB_API_KEY", "5ad652c0")
+
+HEADERS = {"User-Agent": "CodeAlpha-MovieAnalytics/1.0 (student project)"}
 RAW_CSV = "data/movies_raw.csv"
 CHECKPOINT_EVERY = 20
-REQUEST_DELAY_SEC = 0.25  # be polite to the OMDb API
+REQUEST_DELAY_SEC = 0.25
 
 
-def scrape_highest_grossing_films() -> pd.DataFrame:
-    """Scrape the highest-grossing films table from Wikipedia."""
+def scrape_highest_grossing_films():
+    """Pull the highest-grossing films table straight off Wikipedia."""
     print(f"Fetching {WIKI_URL} ...")
     resp = requests.get(WIKI_URL, headers=HEADERS, timeout=15)
     resp.raise_for_status()
@@ -71,15 +57,15 @@ def scrape_highest_grossing_films() -> pd.DataFrame:
             continue
         # The table we want has a "Worldwide gross" (or similar) column
         cols_lower = [str(c).lower() for c in df.columns]
+        # this is the table that has both a title and a gross column
         if any("gross" in c for c in cols_lower) and any("title" in c for c in cols_lower):
             target_df = df
             break
 
     if target_df is None:
         raise RuntimeError(
-            "Could not find the highest-grossing films table. "
-            "Wikipedia may have changed its page layout - inspect the page "
-            "manually and update the column-matching logic above."
+            "Couldn't find the right table - Wikipedia might have changed "
+            "the page layout. Worth checking the page manually."
         )
 
     # Normalize column names
@@ -99,7 +85,7 @@ def scrape_highest_grossing_films() -> pd.DataFrame:
             rename_map[c] = "peak"
     target_df = target_df.rename(columns=rename_map)
 
-    # Clean title text (footnote markers, reference numbers)
+    # strip footnote markers like [1] off the titles
     target_df["title"] = (
         target_df["title"].astype(str).str.replace(r"\[.*?\]", "", regex=True).str.strip()
     )
@@ -111,21 +97,15 @@ def scrape_highest_grossing_films() -> pd.DataFrame:
     return target_df
 
 
-def clean_title_for_query(title: str) -> str:
-    """Strip characters that commonly break OMDb title matching."""
-    title = re.sub(r"\(.*?\)", "", title)  # remove parenthetical notes
+def clean_title_for_query(title):
+    # OMDb chokes on parenthetical notes like "(film)" so strip those out
+    title = re.sub(r"\(.*?\)", "", title)
     return title.strip()
 
 
-def fetch_omdb_details(title: str, year: str = None) -> dict:
-    """Query OMDb for one movie. Falls back to a title-only search if the
-    title+year lookup fails (OMDb is picky about exact titles/years)."""
-    if not OMDB_API_KEY:
-        raise RuntimeError(
-            "OMDB_API_KEY is not set. Get a free key at "
-            "https://www.omdbapi.com/apikey.aspx and set it as an env variable."
-        )
-
+def fetch_omdb_details(title, year=None):
+    """Look up one movie on OMDb. If title+year doesn't match anything,
+    try again without the year - OMDb can be fussy about that."""
     params = {"apikey": OMDB_API_KEY, "t": clean_title_for_query(title), "plot": "short"}
     if year and str(year).strip().isdigit():
         params["y"] = str(year).strip()[:4]
@@ -161,9 +141,9 @@ def fetch_omdb_details(title: str, year: str = None) -> dict:
     }
 
 
-def enrich_with_omdb(df: pd.DataFrame) -> pd.DataFrame:
-    """Loop over the scraped movies and enrich each with OMDb metadata,
-    saving a checkpoint periodically so progress is never lost."""
+def enrich_with_omdb(df):
+    """Go through every movie and add the OMDb details, saving a checkpoint
+    every so often so a crash halfway through doesn't lose everything."""
     enriched_rows = []
     os.makedirs("data", exist_ok=True)
 
@@ -174,7 +154,7 @@ def enrich_with_omdb(df: pd.DataFrame) -> pd.DataFrame:
 
         if (i + 1) % CHECKPOINT_EVERY == 0 or (i + 1) == len(df):
             pd.DataFrame(enriched_rows).to_csv(RAW_CSV, index=False)
-            print(f"  ...{i + 1}/{len(df)} movies processed (checkpoint saved)")
+            print(f"  ...{i + 1}/{len(df)} done (checkpoint saved)")
 
         time.sleep(REQUEST_DELAY_SEC)
 
@@ -183,11 +163,11 @@ def enrich_with_omdb(df: pd.DataFrame) -> pd.DataFrame:
 
 def main():
     base_df = scrape_highest_grossing_films()
-    print("Enriching with OMDb data (this can take a few minutes for 200+ titles)...")
+    print("Enriching with OMDb data, this'll take a few minutes for 200+ titles...")
     full_df = enrich_with_omdb(base_df)
     os.makedirs("data", exist_ok=True)
     full_df.to_csv(RAW_CSV, index=False)
-    print(f"\nDone. Saved {len(full_df)} enriched movie records to {RAW_CSV}")
+    print(f"\nDone. Saved {len(full_df)} movies to {RAW_CSV}")
     print(full_df.head())
 
 
