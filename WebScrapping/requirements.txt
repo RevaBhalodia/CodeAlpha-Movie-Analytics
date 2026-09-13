@@ -1,0 +1,23 @@
+# Task 1 - Web Scraping
+requests
+beautifulsoup4
+lxml
+pandas
+
+# Task 2 - EDA
+numpy
+scipy
+
+# Task 3 - Data Visualization
+matplotlib
+seaborn
+plotly
+
+# Task 4 - Sentiment Analysis
+nltk
+vaderSentiment
+scikit-learn
+wordcloud
+
+# Notebooks
+jupyter
