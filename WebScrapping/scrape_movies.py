@@ -85,10 +85,12 @@ def scrape_highest_grossing_films():
             rename_map[c] = "peak"
     target_df = target_df.rename(columns=rename_map)
 
-    # strip footnote markers like [1] off the titles
-    target_df["title"] = (
-        target_df["title"].astype(str).str.replace(r"\[.*?\]", "", regex=True).str.strip()
-    )
+    # strip footnote markers like [1] off every column - if left in, a reference
+    # number can bleed straight into the digits when we clean the gross figures later
+    for col in target_df.columns:
+        target_df[col] = (
+            target_df[col].astype(str).str.replace(r"\[.*?\]", "", regex=True).str.strip()
+        )
 
     keep_cols = [c for c in ["rank", "peak", "title", "worldwide_gross", "year"] if c in target_df.columns]
     target_df = target_df[keep_cols].drop_duplicates(subset="title").reset_index(drop=True)
@@ -103,32 +105,107 @@ def clean_title_for_query(title):
     return title.strip()
 
 
-def fetch_omdb_details(title, year=None):
-    """Look up one movie on OMDb. If title+year doesn't match anything,
-    try again without the year - OMDb can be fussy about that."""
-    params = {"apikey": OMDB_API_KEY, "t": clean_title_for_query(title), "plot": "short"}
-    if year and str(year).strip().isdigit():
-        params["y"] = str(year).strip()[:4]
+def roman_numeral_variant(title):
+    """'Frozen 2' -> 'Frozen II', 'Toy Story 3' -> 'Toy Story III', etc.
+    IMDb's official titles almost always use Roman numerals for sequels, which is
+    a common cause of OMDb matching the wrong (unrelated) title entirely."""
+    numeral_map = {"2": "II", "3": "III", "4": "IV", "5": "V", "6": "VI"}
+    match = re.match(r"^(.*)\s([2-6])$", title.strip())
+    if not match:
+        return None
+    base, digit = match.groups()
+    return f"{base} {numeral_map[digit]}"
 
+
+# A movie that made the highest-grossing list of all time will always have a huge
+# IMDb vote count. If OMDb hands back a match with way fewer votes than this, it's
+# almost certainly the wrong movie (classic trap: "Frozen 2" vs the official "Frozen II").
+MIN_PLAUSIBLE_VOTES = 20000
+
+
+def _omdb_get(params):
     try:
-        r = requests.get(OMDB_URL, params=params, timeout=10)
-        data = r.json()
+        r = requests.get(OMDB_URL, params={**params, "apikey": OMDB_API_KEY}, timeout=10)
+        return r.json()
     except (requests.RequestException, json.JSONDecodeError):
         return {}
 
+
+def _votes_to_int(votes_str):
+    if not votes_str or votes_str == "N/A":
+        return 0
+    try:
+        return int(votes_str.replace(",", ""))
+    except ValueError:
+        return 0
+
+
+def _lookup_by_title(title, year=None):
+    params = {"t": clean_title_for_query(title), "plot": "short"}
+    if year and str(year).strip().isdigit():
+        params["y"] = str(year).strip()[:4]
+
+    data = _omdb_get(params)
     if data.get("Response") == "False" and "y" in params:
         # Retry without the year constraint in case OMDb has a different year on file
         params.pop("y")
+        data = _omdb_get(params)
+    return data
+
+
+def _lookup_via_search(title, year=None):
+    """Fallback: search OMDb instead of guessing the exact title, then pull full
+    details for the best-looking candidate (closest year, movie type only)."""
+    search_params = {"s": clean_title_for_query(title), "type": "movie"}
+    data = _omdb_get(search_params)
+    candidates = data.get("Search", []) if data.get("Response") == "True" else []
+    if not candidates:
+        return {}
+
+    def year_distance(c):
         try:
-            r = requests.get(OMDB_URL, params=params, timeout=10)
-            data = r.json()
-        except (requests.RequestException, json.JSONDecodeError):
-            return {}
+            return abs(int(c.get("Year", "0")[:4]) - int(str(year)[:4]))
+        except (ValueError, TypeError):
+            return 99
+    candidates.sort(key=year_distance)
+
+    best = candidates[0]
+    imdb_id = best.get("imdbID")
+    if not imdb_id:
+        return {}
+    return _omdb_get({"i": imdb_id, "plot": "short"})
+
+
+def fetch_omdb_details(title, year=None):
+    """Look up one movie on OMDb, with sanity checks to catch mismatched titles.
+    Order of attempts: exact title -> Roman-numeral variant (Frozen 2 -> Frozen II)
+    -> search endpoint. If nothing plausible turns up, we'd rather leave the row
+    blank than silently keep a wrong match."""
+    data = _lookup_by_title(title, year)
+
+    if data.get("Response") == "False" or _votes_to_int(data.get("imdbVotes")) < MIN_PLAUSIBLE_VOTES:
+        variant = roman_numeral_variant(clean_title_for_query(title))
+        if variant:
+            variant_data = _lookup_by_title(variant, year)
+            if _votes_to_int(variant_data.get("imdbVotes")) >= MIN_PLAUSIBLE_VOTES:
+                data = variant_data
+
+    if data.get("Response") == "False" or _votes_to_int(data.get("imdbVotes")) < MIN_PLAUSIBLE_VOTES:
+        search_data = _lookup_via_search(title, year)
+        if _votes_to_int(search_data.get("imdbVotes")) >= MIN_PLAUSIBLE_VOTES:
+            data = search_data
+
+    # Still no plausible match after all three attempts. Rather than dropping the
+    # row outright (a genuinely recent release can have low votes for real, not
+    # because of a mismatch), keep the data but flag it so it's easy to spot and
+    # spot-check in the EDA step.
+    match_uncertain = _votes_to_int(data.get("imdbVotes")) < MIN_PLAUSIBLE_VOTES
 
     if data.get("Response") == "False":
         return {}
 
     return {
+        "match_uncertain": match_uncertain,
         "genre": data.get("Genre"),
         "imdb_rating": data.get("imdbRating"),
         "imdb_votes": data.get("imdbVotes"),
